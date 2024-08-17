@@ -4,6 +4,19 @@ All notable changes to the "claude-dev" extension will be documented in this fil
 
 <!-- Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file. -->
 
+## [1.2.0]
+
+- Add support for Prompt Caching to significantly reduce costs and response times (currently only available through Anthropic API for Claude 3.5 Sonnet and Claude 3.0 Haiku)
+
+## [1.1.1]
+
+- Adds option to choose other Claude models (+ GPT-4o, DeepSeek, and Mistral if you use OpenRouter)
+- Adds option to add custom instructions to the end of the system prompt
+
+## [1.1.0]
+
+- Paste images in chat to use Claude's vision capabilities and turn mockups into fully functional applications or fix bugs with screenshots
+
 ## [1.0.9]
 
 - Add support for OpenRouter and AWS Bedrock

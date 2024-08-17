@@ -1,28 +1,43 @@
-import { ClaudeAsk, ClaudeMessage, ExtensionMessage } from "@shared/ExtensionMessage"
 import { VSCodeButton, VSCodeLink } from "@vscode/webview-ui-toolkit/react"
 import { KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import vsDarkPlus from "react-syntax-highlighter/dist/esm/styles/prism/vsc-dark-plus"
 import DynamicTextArea from "react-textarea-autosize"
 import { useEvent, useMount } from "react-use"
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso"
+import { ClaudeAsk, ClaudeMessage, ExtensionMessage } from "../../../src/shared/ExtensionMessage"
 import { combineApiRequests } from "../utils/combineApiRequests"
 import { combineCommandSequences } from "../utils/combineCommandSequences"
 import { getApiMetrics } from "../utils/getApiMetrics"
 import { getSyntaxHighlighterStyleFromTheme } from "../utils/getSyntaxHighlighterStyleFromTheme"
 import { vscode } from "../utils/vscode"
+import Announcement from "./Announcement"
 import ChatRow from "./ChatRow"
 import TaskHeader from "./TaskHeader"
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso"
-import Announcement from "./Announcement"
+import Thumbnails from "./Thumbnails"
 
 interface ChatViewProps {
+	version: string
 	messages: ClaudeMessage[]
 	isHidden: boolean
 	vscodeThemeName?: string
 	showAnnouncement: boolean
+	selectedModelSupportsImages: boolean
+	selectedModelSupportsPromptCache: boolean
 	hideAnnouncement: () => void
 }
-// maybe instead of storing state in App, just make chatview  always show so dont conditionally load/unload? need to make sure messages are persisted (i remember seeing something about how webviews can be frozen in docs)
-const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideAnnouncement }: ChatViewProps) => {
+
+const MAX_IMAGES_PER_MESSAGE = 20 // Anthropic limits to 20 images
+
+const ChatView = ({
+	version,
+	messages,
+	isHidden,
+	vscodeThemeName,
+	showAnnouncement,
+	selectedModelSupportsImages,
+	selectedModelSupportsPromptCache,
+	hideAnnouncement,
+}: ChatViewProps) => {
 	//const task = messages.length > 0 ? (messages[0].say === "task" ? messages[0] : undefined) : undefined
 	const task = messages.length > 0 ? messages[0] : undefined // leaving this less safe version here since if the first message is not a task, then the extension is in a bad state and needs to be debugged (see ClaudeDev.abort)
 	const modifiedMessages = useMemo(() => combineApiRequests(combineCommandSequences(messages.slice(1))), [messages])
@@ -32,6 +47,9 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 	const [inputValue, setInputValue] = useState("")
 	const textAreaRef = useRef<HTMLTextAreaElement>(null)
 	const [textAreaDisabled, setTextAreaDisabled] = useState(false)
+	const [isTextAreaFocused, setIsTextAreaFocused] = useState(false)
+	const [selectedImages, setSelectedImages] = useState<string[]>([])
+	const [thumbnailsHeight, setThumbnailsHeight] = useState(0)
 
 	// we need to hold on to the ask because useEffect > lastMessage will always let us know when an ask comes in and handle it, but by the time handleMessage is called, the last message might not be the ask anymore (it could be a say that followed)
 	const [claudeAsk, setClaudeAsk] = useState<ClaudeAsk | undefined>(undefined)
@@ -39,11 +57,8 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 	const [enableButtons, setEnableButtons] = useState<boolean>(false)
 	const [primaryButtonText, setPrimaryButtonText] = useState<string | undefined>(undefined)
 	const [secondaryButtonText, setSecondaryButtonText] = useState<string | undefined>(undefined)
-
 	const [syntaxHighlighterStyle, setSyntaxHighlighterStyle] = useState(vsDarkPlus)
-
 	const virtuosoRef = useRef<VirtuosoHandle>(null)
-
 	const [expandedRows, setExpandedRows] = useState<Record<number, boolean>>({})
 
 	const toggleRowExpansion = (ts: number) => {
@@ -136,6 +151,7 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 								// if the last ask is a command_output, and we receive an api_req_started, then that means the command has finished and we don't need input from the user anymore (in every other case, the user has to interact with input field or buttons to continue, which does the following automatically)
 								setInputValue("")
 								setTextAreaDisabled(true)
+								setSelectedImages([])
 								setClaudeAsk(undefined)
 								setEnableButtons(false)
 							}
@@ -173,9 +189,9 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 
 	const handleSendMessage = () => {
 		const text = inputValue.trim()
-		if (text) {
+		if (text || selectedImages.length > 0) {
 			if (messages.length === 0) {
-				vscode.postMessage({ type: "newTask", text })
+				vscode.postMessage({ type: "newTask", text, images: selectedImages })
 			} else if (claudeAsk) {
 				switch (claudeAsk) {
 					case "followup":
@@ -183,13 +199,19 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 					case "command": // user can provide feedback to a tool or command use
 					case "command_output": // user can send input to command stdin
 					case "completion_result": // if this happens then the user has feedback for the completion result
-						vscode.postMessage({ type: "askResponse", askResponse: "textResponse", text })
+						vscode.postMessage({
+							type: "askResponse",
+							askResponse: "messageResponse",
+							text,
+							images: selectedImages,
+						})
 						break
 					// there is no other case that a textfield should be enabled
 				}
 			}
 			setInputValue("")
 			setTextAreaDisabled(true)
+			setSelectedImages([])
 			setClaudeAsk(undefined)
 			setEnableButtons(false)
 			// setPrimaryButtonText(undefined)
@@ -255,6 +277,65 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 		vscode.postMessage({ type: "clearTask" })
 	}
 
+	const selectImages = () => {
+		vscode.postMessage({ type: "selectImages" })
+	}
+
+	const handlePaste = async (e: React.ClipboardEvent) => {
+		if (shouldDisableImages) {
+			e.preventDefault()
+			return
+		}
+
+		const items = e.clipboardData.items
+		const acceptedTypes = ["png", "jpeg", "webp"] // supported by anthropic and openrouter (jpg is just a file extension but the image will be recognized as jpeg)
+		const imageItems = Array.from(items).filter((item) => {
+			const [type, subtype] = item.type.split("/")
+			return type === "image" && acceptedTypes.includes(subtype)
+		})
+		if (imageItems.length > 0) {
+			e.preventDefault()
+			const imagePromises = imageItems.map((item) => {
+				return new Promise<string | null>((resolve) => {
+					const blob = item.getAsFile()
+					if (!blob) {
+						resolve(null)
+						return
+					}
+					const reader = new FileReader()
+					reader.onloadend = () => {
+						if (reader.error) {
+							console.error("Error reading file:", reader.error)
+							resolve(null)
+						} else {
+							const result = reader.result
+							resolve(typeof result === "string" ? result : null)
+						}
+					}
+					reader.readAsDataURL(blob)
+				})
+			})
+			const imageDataArray = await Promise.all(imagePromises)
+			const dataUrls = imageDataArray.filter((dataUrl): dataUrl is string => dataUrl !== null)
+			//.map((dataUrl) => dataUrl.split(",")[1]) // strip the mime type prefix, sharp doesn't need it
+			if (dataUrls.length > 0) {
+				setSelectedImages((prevImages) => [...prevImages, ...dataUrls].slice(0, MAX_IMAGES_PER_MESSAGE))
+			} else {
+				console.warn("No valid images were processed")
+			}
+		}
+	}
+
+	useEffect(() => {
+		if (selectedImages.length === 0) {
+			setThumbnailsHeight(0)
+		}
+	}, [selectedImages])
+
+	const handleThumbnailsHeightChange = useCallback((height: number) => {
+		setThumbnailsHeight(height)
+	}, [])
+
 	const handleMessage = useCallback(
 		(e: MessageEvent) => {
 			const message: ExtensionMessage = e.data
@@ -266,6 +347,14 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 								textAreaRef.current?.focus()
 							}
 							break
+					}
+					break
+				case "selectedImages":
+					const newImages = message.images ?? []
+					if (newImages.length > 0) {
+						setSelectedImages((prevImages) =>
+							[...prevImages, ...newImages].slice(0, MAX_IMAGES_PER_MESSAGE)
+						)
 					}
 					break
 			}
@@ -308,6 +397,12 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 				case "api_req_finished": // combineApiRequests removes this from modifiedMessages anyways
 				case "api_req_retried": // this message is used to update the latest api_req_started that the request was retried
 					return false
+				case "text":
+					// Sometimes Claude returns an empty text message, we don't want to render these. (We also use a say text for user messages, so in case they just sent images we still render that)
+					if ((message.text ?? "") === "" && (message.images?.length ?? 0) === 0) {
+						return false
+					}
+					break
 			}
 			return true
 		})
@@ -324,12 +419,19 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 		return () => clearTimeout(timer)
 	}, [visibleMessages])
 
-	const placeholderText = useMemo(() => {
+	const [placeholderText, isInputPipingToStdin] = useMemo(() => {
 		if (messages.at(-1)?.ask === "command_output") {
-			return "Type input to command stdin..."
+			return ["Type input to command stdin...", true]
 		}
-		return task ? "Type a message..." : "Type your task here..."
+		const text = task ? "Type a message..." : "Type your task here..."
+		return [text, false]
 	}, [task, messages])
+
+	const shouldDisableImages =
+		!selectedModelSupportsImages ||
+		textAreaDisabled ||
+		selectedImages.length >= MAX_IMAGES_PER_MESSAGE ||
+		isInputPipingToStdin
 
 	return (
 		<div
@@ -345,16 +447,19 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 			}}>
 			{task ? (
 				<TaskHeader
-					taskText={task.text || ""}
+					task={task}
 					tokensIn={apiMetrics.totalTokensIn}
 					tokensOut={apiMetrics.totalTokensOut}
+					doesModelSupportPromptCache={selectedModelSupportsPromptCache}
+					cacheWrites={apiMetrics.totalCacheWrites}
+					cacheReads={apiMetrics.totalCacheReads}
 					totalCost={apiMetrics.totalCost}
 					onClose={handleTaskCloseButtonClick}
 					isHidden={isHidden}
 				/>
 			) : (
 				<>
-					{showAnnouncement && <Announcement hideAnnouncement={hideAnnouncement} />}
+					{showAnnouncement && <Announcement version={version} hideAnnouncement={hideAnnouncement} />}
 					<div style={{ padding: "0 20px" }}>
 						<h2>What can I do for you?</h2>
 						<p>
@@ -365,7 +470,7 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 								Claude 3.5 Sonnet's agentic coding capabilities,
 							</VSCodeLink>{" "}
 							I can handle complex software development tasks step-by-step. With tools that let me create
-							& edit files, analyze project source code, and execute terminal commands (after you grant
+							& edit files, explore complex projects, and execute terminal commands (after you grant
 							permission), I can assist you in ways that go beyond simple code completion or tech support.
 						</p>
 					</div>
@@ -427,13 +532,33 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 					</VSCodeButton>
 				)}
 			</div>
-			<div style={{ padding: "10px 15px", opacity: textAreaDisabled ? 0.5 : 1, position: "relative" }}>
+			<div
+				style={{
+					padding: "10px 15px",
+					opacity: textAreaDisabled ? 0.5 : 1,
+					position: "relative",
+					display: "flex",
+				}}>
+				{!isTextAreaFocused && (
+					<div
+						style={{
+							position: "absolute",
+							inset: "10px 15px",
+							border: "1px solid var(--vscode-input-border)",
+							borderRadius: 2,
+							pointerEvents: "none",
+						}}
+					/>
+				)}
 				<DynamicTextArea
 					ref={textAreaRef}
 					value={inputValue}
 					disabled={textAreaDisabled}
 					onChange={(e) => setInputValue(e.target.value)}
 					onKeyDown={handleKeyDown}
+					onFocus={() => setIsTextAreaFocused(true)}
+					onBlur={() => setIsTextAreaFocused(false)}
+					onPaste={handlePaste}
 					onHeightChange={() =>
 						//virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" })
 						virtuosoRef.current?.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior: "auto" })
@@ -446,32 +571,62 @@ const ChatView = ({ messages, isHidden, vscodeThemeName, showAnnouncement, hideA
 						boxSizing: "border-box",
 						backgroundColor: "var(--vscode-input-background)",
 						color: "var(--vscode-input-foreground)",
-						border: "1px solid var(--vscode-input-border)",
+						//border: "1px solid var(--vscode-input-border)",
 						borderRadius: 2,
 						fontFamily: "var(--vscode-font-family)",
 						fontSize: "var(--vscode-editor-font-size)",
 						lineHeight: "var(--vscode-editor-line-height)",
 						resize: "none",
 						overflow: "hidden",
-						padding: "8px 36px 8px 8px",
+						// Since we have maxRows, when text is long enough it starts to overflow the bottom padding, appearing behind the thumbnails. To fix this, we use a transparent border to push the text up instead. (https://stackoverflow.com/questions/42631947/maintaining-a-padding-inside-of-text-area/52538410#52538410)
+						borderTop: "9px solid transparent",
+						borderBottom: `${thumbnailsHeight + 9}px solid transparent`,
+						borderRight: "54px solid transparent",
+						borderLeft: "9px solid transparent",
+						// Instead of using boxShadow, we use a div with a border to better replicate the behavior when the textarea is focused
+						// boxShadow: "0px 0px 0px 1px var(--vscode-input-border)",
+						padding: 0,
 						cursor: textAreaDisabled ? "not-allowed" : undefined,
+						flex: 1,
 					}}
 				/>
+				{selectedImages.length > 0 && (
+					<Thumbnails
+						images={selectedImages}
+						setImages={setSelectedImages}
+						onHeightChange={handleThumbnailsHeightChange}
+						style={{
+							position: "absolute",
+							paddingTop: 4,
+							bottom: 14,
+							left: 22,
+							right: 67, // (54 + 9) + 4 extra padding
+						}}
+					/>
+				)}
 				<div
 					style={{
 						position: "absolute",
 						right: 20,
+						bottom: 14.5, // Align with the bottom padding of the container
 						display: "flex",
-						alignItems: "center",
-						top: 0,
-						bottom: 1.5,
+						alignItems: "flex-end",
+						height: "calc(100% - 20px)", // Full height minus top and bottom padding
 					}}>
+					<VSCodeButton
+						disabled={shouldDisableImages}
+						appearance="icon"
+						aria-label="Attach Images"
+						onClick={selectImages}
+						style={{ marginRight: "4px" }}>
+						<span className="codicon codicon-device-camera" style={{ fontSize: 18, marginLeft: -2 }}></span>
+					</VSCodeButton>
 					<VSCodeButton
 						disabled={textAreaDisabled}
 						appearance="icon"
 						aria-label="Send Message"
 						onClick={handleSendMessage}>
-						<span className="codicon codicon-send"></span>
+						<span className="codicon codicon-send" style={{ fontSize: 15.5, marginBottom: -1 }}></span>
 					</VSCodeButton>
 				</div>
 			</div>

@@ -1,13 +1,9 @@
-import { Uri, Webview } from "vscode"
-import { Anthropic } from "@anthropic-ai/sdk"
-import os from "os"
-import * as path from "path"
 import * as vscode from "vscode"
 import { ClaudeDev } from "../ClaudeDev"
-import { ApiProvider } from "../shared/api"
+import { ApiModelId, ApiProvider } from "../shared/api"
 import { ExtensionMessage } from "../shared/ExtensionMessage"
 import { WebviewMessage } from "../shared/WebviewMessage"
-
+import { downloadTask, getNonce, getUri, selectImages } from "../utils"
 /*
 https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/default/weather-webview/src/providers/WeatherViewProvider.ts
 
@@ -15,7 +11,13 @@ https://github.com/KumarVariable/vscode-extension-sidebar-html/blob/master/src/c
 */
 
 type SecretKey = "apiKey" | "openRouterApiKey" | "awsAccessKey" | "awsSecretKey"
-type GlobalStateKey = "apiProvider" | "awsRegion" | "maxRequestsPerTask" | "lastShownAnnouncementId"
+type GlobalStateKey =
+	| "apiProvider"
+	| "apiModelId"
+	| "awsRegion"
+	| "maxRequestsPerTask"
+	| "lastShownAnnouncementId"
+	| "customInstructions"
 
 export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 	public static readonly sideBarId = "claude-dev.SidebarProvider" // used in package.json as the view's id. This value cannot be changed due to how vscode caches views based on their id, and updating the id would break existing instances of the extension.
@@ -23,7 +25,7 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 	private disposables: vscode.Disposable[] = []
 	private view?: vscode.WebviewView | vscode.WebviewPanel
 	private claudeDev?: ClaudeDev
-	private latestAnnouncementId = "jul-29-2024" // update to some unique identifier when we add a new announcement
+	private latestAnnouncementId = "aug-15-2024" // update to some unique identifier when we add a new announcement
 
 	constructor(
 		private readonly context: vscode.ExtensionContext,
@@ -134,16 +136,10 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 		this.outputChannel.appendLine("Webview view resolved")
 	}
 
-	async initClaudeDevWithTask(task: string) {
+	async initClaudeDevWithTask(task?: string, images?: string[]) {
 		await this.clearTask() // ensures that an exising task doesn't exist before starting a new one, although this shouldn't be possible since user must clear task before starting a new one
-		const { apiProvider, apiKey, openRouterApiKey, awsAccessKey, awsSecretKey, awsRegion, maxRequestsPerTask } =
-			await this.getState()
-		this.claudeDev = new ClaudeDev(
-			this,
-			task,
-			{ apiProvider, apiKey, openRouterApiKey, awsAccessKey, awsSecretKey, awsRegion },
-			maxRequestsPerTask
-		)
+		const { maxRequestsPerTask, apiConfiguration, customInstructions } = await this.getState()
+		this.claudeDev = new ClaudeDev(this, apiConfiguration, maxRequestsPerTask, customInstructions, task, images)
 	}
 
 	// Send any JSON serializable data to the react app
@@ -203,7 +199,8 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
         create a content security policy meta tag so that only loading scripts with a nonce is allowed
         As your extension grows you will likely want to add custom styles, fonts, and/or images to your webview. If you do, you will need to update the content security policy meta tag to explicity allow for these resources. E.g.
                 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; font-src ${webview.cspSource}; img-src ${webview.cspSource} https:; script-src 'nonce-${nonce}';">
-
+		- 'unsafe-inline' is required for styles due to vscode-webview-toolkit's dynamic style injection
+		- since we pass base64 images to the webview, we need to specify img-src ${webview.cspSource} data:;
 
         in meta tag we add nonce attribute: A cryptographic nonce (only used once) to allow scripts. The server must generate a unique nonce value each time it transmits a policy. It is critical to provide a nonce that cannot be guessed as bypassing a resource's policy is otherwise trivial.
         */
@@ -217,7 +214,7 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width,initial-scale=1,shrink-to-fit=no">
             <meta name="theme-color" content="#000000">
-            <meta http-equiv="Content-Security-Policy" content="default-src 'none'; font-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+            <meta http-equiv="Content-Security-Policy" content="default-src 'none'; font-src ${webview.cspSource}; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data:; script-src 'nonce-${nonce}';">
             <link rel="stylesheet" type="text/css" href="${stylesUri}">
 			<link href="${codiconsUri}" rel="stylesheet" />
             <title>Claude Dev</title>
@@ -253,13 +250,21 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 						// Could also do this in extension .ts
 						//this.postMessageToWebview({ type: "text", text: `Extension: ${Date.now()}` })
 						// initializing new instance of ClaudeDev will make sure that any agentically running promises in old instance don't affect our new task. this essentially creates a fresh slate for the new task
-						await this.initClaudeDevWithTask(message.text!)
+						await this.initClaudeDevWithTask(message.text, message.images)
 						break
 					case "apiConfiguration":
 						if (message.apiConfiguration) {
-							const { apiProvider, apiKey, openRouterApiKey, awsAccessKey, awsSecretKey, awsRegion } =
-								message.apiConfiguration
+							const {
+								apiProvider,
+								apiModelId,
+								apiKey,
+								openRouterApiKey,
+								awsAccessKey,
+								awsSecretKey,
+								awsRegion,
+							} = message.apiConfiguration
 							await this.updateGlobalState("apiProvider", apiProvider)
+							await this.updateGlobalState("apiModelId", apiModelId)
 							await this.storeSecret("apiKey", apiKey)
 							await this.storeSecret("openRouterApiKey", openRouterApiKey)
 							await this.storeSecret("awsAccessKey", awsAccessKey)
@@ -281,8 +286,14 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 						this.claudeDev?.updateMaxRequestsPerTask(result)
 						await this.postStateToWebview()
 						break
+					case "customInstructions":
+						// User may be clearing the field
+						await this.updateGlobalState("customInstructions", message.text || undefined)
+						this.claudeDev?.updateCustomInstructions(message.text || undefined)
+						await this.postStateToWebview()
+						break
 					case "askResponse":
-						this.claudeDev?.handleWebviewAskResponse(message.askResponse!, message.text)
+						this.claudeDev?.handleWebviewAskResponse(message.askResponse!, message.text, message.images)
 						break
 					case "clearTask":
 						// newTask will start a new task with a given task text, while clear task resets the current session and allows for a new task to be started
@@ -294,7 +305,11 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 						await this.postStateToWebview()
 						break
 					case "downloadTask":
-						this.downloadTask()
+						downloadTask(this.claudeDev?.apiConversationHistory ?? [])
+						break
+					case "selectImages":
+						const images = await selectImages()
+						await this.postMessageToWebview({ type: "selectedImages", images })
 						break
 					// Add more switch case statements here as more webview message commands
 					// are created within the webview context (i.e. inside media/main.js)
@@ -305,98 +320,16 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 		)
 	}
 
-	async downloadTask() {
-		// File name
-		const date = new Date()
-		const month = date.toLocaleString("en-US", { month: "short" }).toLowerCase()
-		const day = date.getDate()
-		const year = date.getFullYear()
-		let hours = date.getHours()
-		const minutes = date.getMinutes().toString().padStart(2, "0")
-		const ampm = hours >= 12 ? "pm" : "am"
-		hours = hours % 12
-		hours = hours ? hours : 12 // the hour '0' should be '12'
-		const fileName = `claude_dev_task_${month}-${day}-${year}_${hours}-${minutes}-${ampm}.md`
-
-		// Generate markdown
-		const conversationHistory = this.claudeDev?.apiConversationHistory || []
-		const markdownContent = conversationHistory
-			.map((message) => {
-				const role = message.role === "user" ? "**User:**" : "**Assistant:**"
-				const content = Array.isArray(message.content)
-					? message.content.map(this.formatContentBlockToMarkdown).join("\n")
-					: message.content
-
-				return `${role}\n\n${content}\n\n`
-			})
-			.join("---\n\n")
-
-		// Prompt user for save location
-		const saveUri = await vscode.window.showSaveDialog({
-			filters: { Markdown: ["md"] },
-			defaultUri: vscode.Uri.file(path.join(os.homedir(), "Downloads", fileName)),
-		})
-
-		if (saveUri) {
-			// Write content to the selected location
-			await vscode.workspace.fs.writeFile(saveUri, Buffer.from(markdownContent))
-			vscode.window.showTextDocument(saveUri, { preview: true })
-		}
-	}
-
-	private formatContentBlockToMarkdown(
-		block:
-			| Anthropic.TextBlockParam
-			| Anthropic.ImageBlockParam
-			| Anthropic.ToolUseBlockParam
-			| Anthropic.ToolResultBlockParam
-	): string {
-		switch (block.type) {
-			case "text":
-				return block.text
-			case "image":
-				return `[Image: ${block.source.media_type}]`
-			case "tool_use":
-				let input: string
-				if (typeof block.input === "object" && block.input !== null) {
-					input = Object.entries(block.input)
-						.map(([key, value]) => `${key.charAt(0).toUpperCase() + key.slice(1)}: ${value}`)
-						.join("\n")
-				} else {
-					input = String(block.input)
-				}
-				return `[Tool Use: ${block.name}]\n${input}`
-			case "tool_result":
-				if (typeof block.content === "string") {
-					return `[Tool Result${block.is_error ? " (Error)" : ""}]\n${block.content}`
-				} else if (Array.isArray(block.content)) {
-					return `[Tool Result${block.is_error ? " (Error)" : ""}]\n${block.content
-						.map(this.formatContentBlockToMarkdown)
-						.join("\n")}`
-				} else {
-					return `[Tool Result${block.is_error ? " (Error)" : ""}]`
-				}
-			default:
-				return "[Unexpected content type]"
-		}
-	}
-
 	async postStateToWebview() {
-		const {
-			apiProvider,
-			apiKey,
-			openRouterApiKey,
-			awsAccessKey,
-			awsSecretKey,
-			awsRegion,
-			maxRequestsPerTask,
-			lastShownAnnouncementId,
-		} = await this.getState()
+		const { apiConfiguration, maxRequestsPerTask, lastShownAnnouncementId, customInstructions } =
+			await this.getState()
 		this.postMessageToWebview({
 			type: "state",
 			state: {
-				apiConfiguration: { apiProvider, apiKey, openRouterApiKey, awsAccessKey, awsSecretKey, awsRegion },
+				version: this.context.extension?.packageJSON?.version ?? "",
+				apiConfiguration,
 				maxRequestsPerTask,
+				customInstructions,
 				themeName: vscode.workspace.getConfiguration("workbench").get<string>("colorTheme"),
 				claudeMessages: this.claudeDev?.claudeMessages || [],
 				shouldShowAnnouncement: lastShownAnnouncementId !== this.latestAnnouncementId,
@@ -405,12 +338,8 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 	}
 
 	async clearTask() {
-		if (this.claudeDev) {
-			this.claudeDev.abort = true // will stop any agentically running promises
-			this.claudeDev = undefined // removes reference to it, so once promises end it will be garbage collected
-		}
-		// this.setApiConversationHistory(undefined)
-		// this.setClaudeMessages(undefined)
+		this.claudeDev?.abortTask()
+		this.claudeDev = undefined // removes reference to it, so once promises end it will be garbage collected
 	}
 
 	// Caching mechanism to keep track of webview messages + API conversation history per provider instance
@@ -496,7 +425,8 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 
 	async getState() {
 		const [
-			apiProvider,
+			storedApiProvider,
+			apiModelId,
 			apiKey,
 			openRouterApiKey,
 			awsAccessKey,
@@ -504,8 +434,10 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 			awsRegion,
 			maxRequestsPerTask,
 			lastShownAnnouncementId,
+			customInstructions,
 		] = await Promise.all([
 			this.getGlobalState("apiProvider") as Promise<ApiProvider | undefined>,
+			this.getGlobalState("apiModelId") as Promise<ApiModelId | undefined>,
 			this.getSecret("apiKey") as Promise<string | undefined>,
 			this.getSecret("openRouterApiKey") as Promise<string | undefined>,
 			this.getSecret("awsAccessKey") as Promise<string | undefined>,
@@ -513,16 +445,36 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 			this.getGlobalState("awsRegion") as Promise<string | undefined>,
 			this.getGlobalState("maxRequestsPerTask") as Promise<number | undefined>,
 			this.getGlobalState("lastShownAnnouncementId") as Promise<string | undefined>,
+			this.getGlobalState("customInstructions") as Promise<string | undefined>,
 		])
+
+		let apiProvider: ApiProvider
+		if (storedApiProvider) {
+			apiProvider = storedApiProvider
+		} else {
+			// Either new user or legacy user that doesn't have the apiProvider stored in state
+			// (If they're using OpenRouter or Bedrock, then apiProvider state will exist)
+			if (apiKey) {
+				apiProvider = "anthropic"
+			} else {
+				// New users should default to anthropic (openrouter has issues, bedrock is complicated)
+				apiProvider = "anthropic"
+			}
+		}
+
 		return {
-			apiProvider: apiProvider || "anthropic", // for legacy users that were using Anthropic by default
-			apiKey,
-			openRouterApiKey,
-			awsAccessKey,
-			awsSecretKey,
-			awsRegion,
+			apiConfiguration: {
+				apiProvider,
+				apiModelId,
+				apiKey,
+				openRouterApiKey,
+				awsAccessKey,
+				awsSecretKey,
+				awsRegion,
+			},
 			maxRequestsPerTask,
 			lastShownAnnouncementId,
+			customInstructions,
 		}
 	}
 
@@ -569,36 +521,4 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 	private async getSecret(key: SecretKey) {
 		return await this.context.secrets.get(key)
 	}
-}
-
-/**
- * A helper function that returns a unique alphanumeric identifier called a nonce.
- *
- * @remarks This function is primarily used to help enforce content security
- * policies for resources/scripts being executed in a webview context.
- *
- * @returns A nonce
- */
-export function getNonce() {
-	let text = ""
-	const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-	for (let i = 0; i < 32; i++) {
-		text += possible.charAt(Math.floor(Math.random() * possible.length))
-	}
-	return text
-}
-
-/**
- * A helper function which will get the webview URI of a given file or resource.
- *
- * @remarks This URI can be used within a webview's HTML as a link to the
- * given file/resource.
- *
- * @param webview A reference to the extension webview
- * @param extensionUri The URI of the directory containing the extension
- * @param pathList An array of strings representing the path to a file/resource
- * @returns A URI pointing to the file/resource
- */
-export function getUri(webview: Webview, extensionUri: Uri, pathList: string[]) {
-	return webview.asWebviewUri(Uri.joinPath(extensionUri, ...pathList))
 }

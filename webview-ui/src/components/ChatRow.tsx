@@ -1,11 +1,12 @@
-import { ClaudeAsk, ClaudeMessage, ClaudeSay, ClaudeSayTool } from "@shared/ExtensionMessage"
 import { VSCodeBadge, VSCodeButton, VSCodeProgressRing } from "@vscode/webview-ui-toolkit/react"
 import React from "react"
+import Markdown from "react-markdown"
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter"
+import { ClaudeAsk, ClaudeMessage, ClaudeSay, ClaudeSayTool } from "../../../src/shared/ExtensionMessage"
 import { COMMAND_OUTPUT_STRING } from "../utils/combineCommandSequences"
 import { SyntaxHighlighterStyle } from "../utils/getSyntaxHighlighterStyleFromTheme"
 import CodeBlock from "./CodeBlock/CodeBlock"
-import Markdown from "react-markdown"
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter"
+import Thumbnails from "./Thumbnails"
 
 interface ChatRowProps {
 	message: ClaudeMessage
@@ -294,7 +295,10 @@ const ChatRow: React.FC<ChatRowProps> = ({
 									whiteSpace: "pre-line",
 									wordWrap: "break-word",
 								}}>
-								<span>{message.text}</span>
+								<span style={{ display: "block" }}>{message.text}</span>
+								{message.images && message.images.length > 0 && (
+									<Thumbnails images={message.images} style={{ marginTop: "8px" }} />
+								)}
 							</div>
 						)
 					case "error":

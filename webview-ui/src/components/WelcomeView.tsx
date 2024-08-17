@@ -1,6 +1,6 @@
-import { ApiConfiguration } from "@shared/api"
 import { VSCodeButton, VSCodeLink } from "@vscode/webview-ui-toolkit/react"
 import React, { useEffect, useState } from "react"
+import { ApiConfiguration } from "../../../src/shared/api"
 import { validateApiConfiguration } from "../utils/validate"
 import { vscode } from "../utils/vscode"
 import ApiOptions from "./ApiOptions"
@@ -34,13 +34,17 @@ const WelcomeView: React.FC<WelcomeViewProps> = ({ apiConfiguration, setApiConfi
 					Claude 3.5 Sonnet's agentic coding capabilities.
 				</VSCodeLink>{" "}
 				I am prompted to think through tasks step-by-step and have access to tools that let me create & edit
-				files, analyze project source code, and execute terminal commands (with your permission, of course).
+				files, explore complex projects, and execute terminal commands (with your permission, of course).
 			</p>
 
 			<b>To get started, this extension needs an API key for Claude 3.5 Sonnet:</b>
 
 			<div style={{ marginTop: "15px" }}>
-				<ApiOptions apiConfiguration={apiConfiguration} setApiConfiguration={setApiConfiguration} />
+				<ApiOptions
+					apiConfiguration={apiConfiguration}
+					setApiConfiguration={setApiConfiguration}
+					showModelOptions={false}
+				/>
 				<VSCodeButton onClick={handleSubmit} disabled={disableLetsGoButton} style={{ marginTop: "3px" }}>
 					Let's go!
 				</VSCodeButton>
